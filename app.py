@@ -2,20 +2,25 @@ import json
 import html
 import hashlib
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
 from typing import Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 
 from config import APP_NAME, DB_PATH, DEFAULT_THEME, DEFAULT_USERS
 
-STORE_VERSION = 4
+STORE_VERSION = 5
 RETIRED_USERNAMES = {"reader1", "reader2", "reader_one", "reader_two"}
 RETIRED_DISPLAY_NAMES = {"Reader One", "Reader Two"}
 RETIRED_DISPLAY_NAMES_LOWER = {name.lower() for name in RETIRED_DISPLAY_NAMES}
+NAV_OPTIONS = ["Home", "Profile", "Discover", "Book Detail", "My Library", "Compare", "Settings"]
+DEVICE_COOKIE_NAME = "booxd_device_token"
+DEVICE_TOKEN_TTL_DAYS = 30
+MAX_DEVICE_TOKENS_PER_USER = 5
 
 
 # --- Helpers: auth & persistence ------------------------------------------------
@@ -82,8 +87,10 @@ class DataStore:
         data.setdefault("library", {})
         data.setdefault("books", {})
         data.setdefault("activities", [])
+        data.setdefault("device_tokens", {})
 
         self._prune_retired_users(data)
+        self._prune_device_tokens(data)
 
         # Ensure seed users exist
         for user in self.seed_users:
@@ -106,7 +113,7 @@ class DataStore:
 
     def _seed(self) -> Dict:
         """Create initial database structure with seeded users."""
-        data = {"users": {}, "library": {}, "books": {}, "activities": []}
+        data = {"users": {}, "library": {}, "books": {}, "activities": [], "device_tokens": {}}
         for user in self.seed_users:
             salt, pw_hash = hash_password(user["password"])
             username = user["username"]
@@ -134,6 +141,40 @@ class DataStore:
             return
         data["activities"] = [act for act in data["activities"] if act.get("username") not in removed]
 
+    def _prune_device_tokens(self, data: Dict) -> None:
+        """Remove tokens for deleted users or expired entries and cap per-user count."""
+        tokens = data.setdefault("device_tokens", {})
+        valid_users = set(data.get("users", {}).keys())
+        now = datetime.utcnow()
+        for token_hash, meta in list(tokens.items()):
+            username = meta.get("username")
+            created_at = meta.get("created_at")
+            if not username or username not in valid_users:
+                tokens.pop(token_hash, None)
+                continue
+            if created_at:
+                try:
+                    created_dt = datetime.fromisoformat(created_at)
+                    if now - created_dt > timedelta(days=DEVICE_TOKEN_TTL_DAYS + 7):
+                        tokens.pop(token_hash, None)
+                        continue
+                except ValueError:
+                    tokens.pop(token_hash, None)
+                    continue
+        self._cap_tokens_per_user(tokens)
+
+    def _cap_tokens_per_user(self, tokens: Dict[str, Dict]) -> None:
+        per_user: Dict[str, List[Tuple[str, Optional[str]]]] = {}
+        for token_hash, meta in tokens.items():
+            user = meta.get("username")
+            if not user:
+                continue
+            per_user.setdefault(user, []).append((token_hash, meta.get("created_at")))
+        for _, entries in per_user.items():
+            entries.sort(key=lambda item: item[1] or "", reverse=True)
+            for token_hash, _ in entries[MAX_DEVICE_TOKENS_PER_USER:]:
+                tokens.pop(token_hash, None)
+
     def _write(self, data: Dict) -> None:
         with self.path.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -147,6 +188,35 @@ class DataStore:
         if not user:
             return False
         return verify_password(password, user["salt"], user["password_hash"])
+
+    def _hash_token(self, token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def register_device_token(self, username: str) -> str:
+        token = secrets.token_urlsafe(32)
+        token_hash = self._hash_token(token)
+        tokens = self.db.setdefault("device_tokens", {})
+        tokens[token_hash] = {"username": username, "created_at": now_ts()}
+        self._cap_tokens_per_user(tokens)
+        self.save()
+        return token
+
+    def resolve_device_token(self, token: str) -> Optional[str]:
+        if not token:
+            return None
+        token_hash = self._hash_token(token)
+        record = self.db.get("device_tokens", {}).get(token_hash)
+        if not record:
+            return None
+        return record.get("username")
+
+    def revoke_device_token(self, token: str) -> None:
+        if not token:
+            return
+        token_hash = self._hash_token(token)
+        if token_hash in self.db.get("device_tokens", {}):
+            self.db["device_tokens"].pop(token_hash, None)
+            self.save()
 
     def change_password(self, username: str, old_password: str, new_password: str) -> bool:
         user = self.db["users"].get(username)
@@ -526,10 +596,22 @@ def get_current_user_accent(store: DataStore, username: str) -> str:
     return user.get("accent") or DEFAULT_THEME["accent"]
 
 
+def restore_user_from_cookie(store: DataStore, cookie_manager: stx.CookieManager) -> Optional[str]:
+    """Return username for a valid device cookie, pruning invalid cookies."""
+    token = cookie_manager.get(DEVICE_COOKIE_NAME)
+    if not token:
+        return None
+    username = store.resolve_device_token(token)
+    if not username:
+        cookie_manager.delete(DEVICE_COOKIE_NAME)
+        return None
+    return username
+
+
 # --- Render functions -----------------------------------------------------------
 
 
-def render_login(store: DataStore) -> None:
+def render_login(store: DataStore, cookie_manager: stx.CookieManager) -> None:
     st.title("📚 Booxd")
     st.caption("A tiny Letterboxd-style tracker for two readers.")
 
@@ -540,6 +622,13 @@ def render_login(store: DataStore) -> None:
         if submitted:
             if store.verify_user(username, password):
                 st.session_state["user"] = username
+                token = store.register_device_token(username)
+                cookie_manager.set(
+                    DEVICE_COOKIE_NAME,
+                    token,
+                    expires_at=datetime.utcnow() + timedelta(days=DEVICE_TOKEN_TTL_DAYS),
+                    same_site="lax",
+                )
                 set_nav("Home")
                 st.success("Logged in")
                 st.rerun()
@@ -547,7 +636,7 @@ def render_login(store: DataStore) -> None:
                 st.error("Invalid credentials")
 
 
-def render_profile_sidebar(store: DataStore, username: str) -> None:
+def render_profile_sidebar(store: DataStore, username: str, cookie_manager: stx.CookieManager) -> None:
     user = store.db["users"].get(username, {})
     lib = store.get_library(username)
     shelf_counts = {key: 0 for key, _ in SHELVES}
@@ -562,6 +651,10 @@ def render_profile_sidebar(store: DataStore, username: str) -> None:
     for key, label in SHELVES:
         st.sidebar.write(f"- {label}: {shelf_counts.get(key,0)}")
     if st.sidebar.button("Log out"):
+        token = cookie_manager.get(DEVICE_COOKIE_NAME)
+        if token:
+            store.revoke_device_token(token)
+            cookie_manager.delete(DEVICE_COOKIE_NAME)
         st.session_state.clear()
         st.rerun()
 
@@ -1069,15 +1162,34 @@ def render_settings(store: DataStore, username: str) -> None:
             st.rerun()
 
 
+@st.cache_resource
+def get_cookie_manager() -> stx.CookieManager:
+    return stx.CookieManager(key="booxd_cookies")
+
+
 # --- Main ----------------------------------------------------------------------
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="📚", layout="wide")
     store = get_store(STORE_VERSION)
+    cookie_manager = get_cookie_manager()
+
     user = st.session_state.get("user")
-    if user:
-        st.session_state["user"] = user
+    if not user:
+        user = restore_user_from_cookie(store, cookie_manager)
+        if user:
+            st.session_state["user"] = user
+    else:
+        # Refresh cookie expiry for an active session
+        token = cookie_manager.get(DEVICE_COOKIE_NAME)
+        if token and store.resolve_device_token(token) == user:
+            cookie_manager.set(
+                DEVICE_COOKIE_NAME,
+                token,
+                expires_at=datetime.utcnow() + timedelta(days=DEVICE_TOKEN_TTL_DAYS),
+                same_site="lax",
+            )
     accent = get_current_user_accent(store, user) if user else DEFAULT_THEME["accent"]
     apply_base_style(accent)
 
@@ -1088,8 +1200,11 @@ def main() -> None:
     nav_param = params.get("nav")
     if isinstance(nav_param, list):
         nav_param = nav_param[0]
-    if nav_param and nav_param.lower() == "book detail".lower():
-        set_nav("Book Detail")
+    nav_target = None
+    if nav_param:
+        nav_target = next((opt for opt in NAV_OPTIONS if opt.lower() == str(nav_param).lower()), None)
+    if nav_target:
+        set_nav(nav_target)
     if work_param:
         book = store.get_book(work_param) or {"key": work_param}
         st.session_state["selected_work"] = {"key": work_param, **book}
@@ -1102,25 +1217,39 @@ def main() -> None:
         st.session_state["nav_state"] = pending_nav
 
     if not user:
-        render_login(store)
+        render_login(store, cookie_manager)
         return
 
-    nav_options = ["Home", "Profile", "Discover", "Book Detail", "My Library", "Compare", "Settings"]
     nav_current = st.session_state.get("nav_state") or st.session_state.get("nav_radio") or "Home"
-    if nav_current not in nav_options:
+    if nav_current not in NAV_OPTIONS:
         nav_current = "Home"
     st.session_state["nav_state"] = nav_current
     st.session_state["nav_radio"] = nav_current
     nav = st.sidebar.radio(
         "Navigate",
-        nav_options,
-        index=nav_options.index(nav_current),
+        NAV_OPTIONS,
+        index=NAV_OPTIONS.index(nav_current),
         key="nav_radio",
     )
     if nav != st.session_state["nav_state"]:
         st.session_state["nav_state"] = nav
+        nav_current = nav
 
-    render_profile_sidebar(store, user)
+    # keep URL params aligned with current nav/work selection so reloads keep context
+    params_updated = False
+    if nav_param != nav_current:
+        st.query_params["nav"] = nav_current
+        params_updated = True
+    selected_work = st.session_state.get("selected_work")
+    if nav_current == "Book Detail" and selected_work and selected_work.get("key"):
+        if work_param != selected_work["key"]:
+            st.query_params["work_key"] = selected_work["key"]
+            params_updated = True
+    elif "work_key" in st.query_params:
+        del st.query_params["work_key"]
+        params_updated = True
+
+    render_profile_sidebar(store, user, cookie_manager)
 
     if nav == "Home":
         render_home(store, user)
