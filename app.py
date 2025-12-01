@@ -81,7 +81,6 @@ class DataStore:
         data.setdefault("library", {})
         data.setdefault("books", {})
         data.setdefault("activities", [])
-        data.setdefault("last_user", None)
 
         self._prune_retired_users(data)
 
@@ -106,7 +105,7 @@ class DataStore:
 
     def _seed(self) -> Dict:
         """Create initial database structure with seeded users."""
-        data = {"users": {}, "library": {}, "books": {}, "activities": [], "last_user": None}
+        data = {"users": {}, "library": {}, "books": {}, "activities": []}
         for user in self.seed_users:
             salt, pw_hash = hash_password(user["password"])
             username = user["username"]
@@ -133,8 +132,6 @@ class DataStore:
         if not removed:
             return
         data["activities"] = [act for act in data["activities"] if act.get("username") not in removed]
-        if data.get("last_user") in removed:
-            data["last_user"] = None
 
     def _write(self, data: Dict) -> None:
         with self.path.open("w", encoding="utf-8") as f:
@@ -319,12 +316,6 @@ class DataStore:
         lib["favorites"] = unique[:4]
         self.save()
 
-    def set_last_user(self, username: Optional[str]) -> None:
-        self.db["last_user"] = username
-        self.save()
-
-    def get_last_user(self) -> Optional[str]:
-        return self.db.get("last_user")
 
 # --- Open Library API helpers ---------------------------------------------------
 
@@ -541,25 +532,15 @@ def render_login(store: DataStore) -> None:
     with st.form("login"):
         username = st.text_input("Username").strip()
         password = st.text_input("Password", type="password")
-        remember = st.checkbox("Remember me on this device", value=True)
         submitted = st.form_submit_button("Log in")
         if submitted:
             if store.verify_user(username, password):
                 st.session_state["user"] = username
-                store.set_last_user(username if remember else None)
                 set_nav("Home")
                 st.success("Logged in")
                 st.rerun()
             else:
                 st.error("Invalid credentials")
-
-    st.markdown(
-        """
-        <small>Default users: <code>kanat / readerpass1</code> and <code>asem / readerpass2</code>.
-        Change them in <code>config.py</code> before first run or via Settings.</small>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def render_profile_sidebar(store: DataStore, username: str) -> None:
@@ -577,7 +558,6 @@ def render_profile_sidebar(store: DataStore, username: str) -> None:
     for key, label in SHELVES:
         st.sidebar.write(f"- {label}: {shelf_counts.get(key,0)}")
     if st.sidebar.button("Log out"):
-        store.set_last_user(None)
         st.session_state.clear()
         st.rerun()
 
@@ -1081,7 +1061,7 @@ def render_settings(store: DataStore, username: str) -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="📚", layout="wide")
     store = get_store(STORE_VERSION)
-    user = st.session_state.get("user") or store.get_last_user()
+    user = st.session_state.get("user")
     if user:
         st.session_state["user"] = user
     accent = get_current_user_accent(store, user) if user else DEFAULT_THEME["accent"]
