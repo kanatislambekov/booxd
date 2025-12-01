@@ -1162,9 +1162,11 @@ def render_settings(store: DataStore, username: str) -> None:
             st.rerun()
 
 
-@st.cache_resource
 def get_cookie_manager() -> stx.CookieManager:
-    return stx.CookieManager(key="booxd_cookies")
+    """Create or reuse a CookieManager; do not cache to avoid widget-in-cache warning."""
+    if "cookie_manager" not in st.session_state:
+        st.session_state["cookie_manager"] = stx.CookieManager(key="booxd_cookies")
+    return st.session_state["cookie_manager"]
 
 
 # --- Main ----------------------------------------------------------------------
@@ -1220,34 +1222,15 @@ def main() -> None:
         render_login(store, cookie_manager)
         return
 
-    nav_current = st.session_state.get("nav_state") or st.session_state.get("nav_radio") or "Home"
+    nav_current = st.session_state.get("nav_state") or "Home"
     if nav_current not in NAV_OPTIONS:
         nav_current = "Home"
-    st.session_state["nav_state"] = nav_current
-    st.session_state["nav_radio"] = nav_current
-    nav = st.sidebar.radio(
-        "Navigate",
-        NAV_OPTIONS,
-        index=NAV_OPTIONS.index(nav_current),
-        key="nav_radio",
-    )
+        st.session_state["nav_state"] = nav_current
+    st.session_state.setdefault("nav_radio", nav_current)
+    nav = st.sidebar.radio("Navigate", NAV_OPTIONS, key="nav_radio")
     if nav != st.session_state["nav_state"]:
         st.session_state["nav_state"] = nav
-        nav_current = nav
-
-    # keep URL params aligned with current nav/work selection so reloads keep context
-    params_updated = False
-    if nav_param != nav_current:
-        st.query_params["nav"] = nav_current
-        params_updated = True
-    selected_work = st.session_state.get("selected_work")
-    if nav_current == "Book Detail" and selected_work and selected_work.get("key"):
-        if work_param != selected_work["key"]:
-            st.query_params["work_key"] = selected_work["key"]
-            params_updated = True
-    elif "work_key" in st.query_params:
-        del st.query_params["work_key"]
-        params_updated = True
+    nav_current = st.session_state["nav_state"]
 
     render_profile_sidebar(store, user, cookie_manager)
 
