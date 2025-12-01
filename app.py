@@ -4,6 +4,7 @@ import hashlib
 import secrets
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -447,6 +448,7 @@ def apply_base_style(accent: str) -> None:
             padding: 0.25rem 0 1rem;
         }}
         .cover-card {{
+            display: block;
             min-width: 170px;
             max-width: 190px;
             background: rgba(17, 24, 39, 0.65);
@@ -454,6 +456,8 @@ def apply_base_style(accent: str) -> None:
             border-radius: 12px;
             box-shadow: 0 10px 24px rgba(0,0,0,0.35);
             transition: transform 120ms ease, border-color 120ms ease;
+            text-decoration: none;
+            color: inherit;
         }}
         .cover-card:hover {{
             transform: translateY(-4px);
@@ -601,23 +605,29 @@ def render_cover_row(title: str, cards: List[Dict], subtitle: Optional[str] = No
             if not cover
             else f"background-image: url('{cover}');"
         )
+        work_key = card.get("work_key")
+        href = f"?nav=Book%20Detail&work_key={quote_plus(work_key)}" if work_key else None
+        wrapper_tag = "a" if href else "div"
+        wrapper_attrs = f"href=\"{href}\"" if href else ""
         html_cards.append(
-            f"<div class='cover-card'>"
+            f"<{wrapper_tag} class='cover-card' {wrapper_attrs}>"
             f"<div class='cover-img' style=\"{cover_style}\"></div>"
             f"<div class='cover-meta'>"
             f"<div class='card-title'>{html.escape(card.get('title', ''))}</div>"
             f"<div class='card-sub'>{html.escape(card.get('meta', ''))}</div>"
             f"<div class='card-footer'>{html.escape(card.get('footer', ''))}</div>"
             f"</div>"
-            f"</div>"
+            f"</{wrapper_tag}>"
         )
     markup = "<div class='card-row'>" + "".join(html_cards) + "</div>"
     st.markdown(markup, unsafe_allow_html=True)
 
 
-def build_activity_cards(store: DataStore) -> List[Dict]:
+def build_activity_cards(store: DataStore, current_user: str) -> List[Dict]:
     cards: List[Dict] = []
     for entry in store.get_activity(limit=12):
+        if entry["username"] == current_user:
+            continue
         book = store.get_book(entry["work_key"])
         cover = cover_url(book.get("cover_id"))
         user = store.db["users"].get(entry["username"], {}).get("display_name", entry["username"])
@@ -639,6 +649,7 @@ def build_activity_cards(store: DataStore) -> List[Dict]:
                 "meta": " · ".join(meta_bits),
                 "footer": f"{user}" + (f" • {date}" if date else ""),
                 "cover": cover,
+                "work_key": entry["work_key"],
             }
         )
     return cards
@@ -667,6 +678,7 @@ def build_popular_cards(store: DataStore, limit: int = 10) -> List[Dict]:
                 "meta": f"{avg:.1f}⭐ · {len(ratings)} rating(s)",
                 "footer": format_authors(book.get("authors", [])),
                 "cover": cover_url(book.get("cover_id")),
+                "work_key": wk,
                 "score": avg,
                 "count": len(ratings),
             }
@@ -697,6 +709,7 @@ def build_favorite_cards(store: DataStore, username: str) -> List[Dict]:
                 "meta": " · ".join(meta_bits) if meta_bits else authors,
                 "footer": authors if meta_bits else "",
                 "cover": cover,
+                "work_key": wk,
             }
         )
     return cards
@@ -725,6 +738,7 @@ def build_user_activity_cards(store: DataStore, username: str, limit: int = 8) -
                 "meta": " · ".join(meta_bits),
                 "footer": date,
                 "cover": cover,
+                "work_key": entry["work_key"],
             }
         )
         if len(cards) >= limit:
@@ -746,7 +760,7 @@ def render_home(store: DataStore, username: str) -> None:
         """,
         unsafe_allow_html=True,
     )
-    render_cover_row("New from friends", build_activity_cards(store), subtitle="Latest shelves, ratings, and reviews.")
+    render_cover_row("New from friends", build_activity_cards(store, username), subtitle="Latest shelves, ratings, and reviews.")
     render_cover_row(
         "Popular with friends",
         build_popular_cards(store),
@@ -1067,6 +1081,20 @@ def main() -> None:
     accent = get_current_user_accent(store, user) if user else DEFAULT_THEME["accent"]
     apply_base_style(accent)
 
+    params = st.query_params
+    work_param = params.get("work_key")
+    if isinstance(work_param, list):
+        work_param = work_param[0]
+    nav_param = params.get("nav")
+    if isinstance(nav_param, list):
+        nav_param = nav_param[0]
+    if nav_param and nav_param.lower() == "book detail".lower():
+        set_nav("Book Detail")
+    if work_param:
+        book = store.get_book(work_param) or {"key": work_param}
+        st.session_state["selected_work"] = {"key": work_param, **book}
+        set_nav("Book Detail")
+
     if "nav_state" not in st.session_state:
         st.session_state["nav_state"] = "Home"
     pending_nav = st.session_state.pop("nav_pending", None)
@@ -1078,7 +1106,7 @@ def main() -> None:
         return
 
     nav_options = ["Home", "Profile", "Discover", "Book Detail", "My Library", "Compare", "Settings"]
-    nav_current = st.session_state.get("nav_radio") or st.session_state.get("nav_state") or "Home"
+    nav_current = st.session_state.get("nav_state") or st.session_state.get("nav_radio") or "Home"
     if nav_current not in nav_options:
         nav_current = "Home"
     st.session_state["nav_state"] = nav_current
